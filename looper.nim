@@ -1,4 +1,55 @@
-import macros
+import macros, sets, tables
+
+proc transLastStmt(n, res, bracketExpr: NimNode): (NimNode, NimNode, NimNode) =
+   # Looks for the last statement of the last statement, etc...
+   case n.kind
+   of nnkStmtList, nnkStmtListExpr, nnkBlockStmt, nnkBlockExpr, nnkWhileStmt,
+         nnkForStmt, nnkIfExpr, nnkIfStmt, nnkTryStmt, nnkCaseStmt,
+         nnkElifBranch, nnkElse, nnkElifExpr:
+      result[0] = copyNimTree(n)
+      result[1] = copyNimTree(n)
+      result[2] = copyNimTree(n)
+      if n.len >= 1:
+         (result[0][^1], result[1][^1], result[2][^1]) = transLastStmt(n[^1],
+               res, bracketExpr)
+   of nnkTableConstr:
+      result[1] = n[0][0]
+      result[2] = n[0][1]
+      bracketExpr.add(bindSym"initTable", newCall(bindSym"typeof", newEmptyNode()),
+            newCall(bindSym"typeof", newEmptyNode()))
+      template adder(res, k, v) = res[k] = v
+      result[0] = getAst(adder(res, n[0][0], n[0][1]))
+   of nnkCurly:
+      result[2] = n[0]
+      bracketExpr.add(bindSym"initHashSet", newCall(bindSym"typeof",
+            newEmptyNode()))
+      template adder(res, v) = res.incl(v)
+      result[0] = getAst(adder(res, n[0]))
+   else:
+      result[2] = n
+      bracketExpr.add(bindSym"newSeq", newCall(bindSym"typeof", newEmptyNode()))
+      template adder(res, v) = res.add(v)
+      result[0] = getAst(adder(res, n))
+
+macro collect*(body): untyped =
+   ## Comprehension for seqs/sets/tables.
+   ##
+   ## The last expression of ``body`` has special syntax that specifies
+   ## the collection's add operation. Use ``{e}`` for set's ``incl``,
+   ## ``{k: v}`` for table's ``[]=`` and ``e`` for seq's ``add``.
+   # analyse the body, find the deepest expression 'it' and replace it via
+   # 'result.add it'
+   let res = genSym(nskVar, "collectResult")
+   let bracketExpr = newNimNode(nnkBracketExpr)
+   let (resBody, keyType, valueType) = transLastStmt(body, res, bracketExpr)
+   if bracketExpr.len == 3:
+      bracketExpr[1][1] = keyType
+      bracketExpr[2][1] = valueType
+   else:
+      bracketExpr[1][1] = valueType
+   result = newTree(nnkStmtListExpr, newVarStmt(res, newTree(nnkCall,
+         bracketExpr)), resBody, res)
+
 {.experimental: "forLoopMacros".}
 
 macro zip*(x: ForLoopStmt): untyped =
@@ -114,3 +165,17 @@ when isMainModule:
       for (x, y, z) in zip(a, b, c):
          res.add (x, y, z)
       assert res == @[(1, 0, "one"), (3, 2, "two"), (5, 4, "three"), (7, 6, "four")]
+
+
+   var data = @["bird", "word"]
+   assert collect(for (i, d) in data.pairs: (if i mod 2 == 0: d)) == @["bird"]
+   assert collect(for (i, d) in data.pairs: {i: d}) == {1: "word",
+         0: "bird"}.toTable
+   assert collect(for d in data.items: {d}) == data.toHashSet
+
+   let y = collect:
+      var data = @["bird", "word"]
+      for (i, d) in data.pairs:
+         if i mod 2 == 0: d
+   assert y == @["bird"]
+   assert collect((var a = 1; for (i, d) in data.pairs: (if i == a: d))) == @["word"]
