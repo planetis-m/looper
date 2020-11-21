@@ -3,14 +3,14 @@ import macros, sets, tables
 proc trans(n, res, bracketExpr: NimNode): (NimNode, NimNode, NimNode) =
   # Looks for the last statement of the last statement, etc...
   case n.kind
-  of nnkIfExpr, nnkIfStmt, nnkTryStmt, nnkCaseStmt:
+  of nnkIfExpr, nnkIfStmt, nnkTryStmt, nnkCaseStmt, nnkWhenStmt:
     result[0] = copyNimTree(n)
     result[1] = copyNimTree(n)
     result[2] = copyNimTree(n)
     for i in ord(n.kind == nnkCaseStmt) ..< n.len:
       (result[0][i], result[1][^1], result[2][^1]) = trans(n[i], res, bracketExpr)
   of nnkStmtList, nnkStmtListExpr, nnkBlockStmt, nnkBlockExpr, nnkWhileStmt,
-      nnkForStmt, nnkElifBranch, nnkExceptBranch, nnkOfBranch, nnkElse, nnkElifExpr:
+      nnkForStmt, nnkElifBranch, nnkElse, nnkElifExpr, nnkOfBranch, nnkExceptBranch:
     result[0] = copyNimTree(n)
     result[1] = copyNimTree(n)
     result[2] = copyNimTree(n)
@@ -21,30 +21,35 @@ proc trans(n, res, bracketExpr: NimNode): (NimNode, NimNode, NimNode) =
     result[1] = n[0][0]
     result[2] = n[0][1]
     if bracketExpr.len == 0:
-      bracketExpr.add(bindSym"initTable", newCall(bindSym"typeof",
-          newEmptyNode()), newCall(bindSym"typeof", newEmptyNode()))
+      bracketExpr.add(bindSym"initTable")
+    if bracketExpr.len == 1:
+      bracketExpr.add([newCall(bindSym"typeof",
+          newEmptyNode()), newCall(bindSym"typeof", newEmptyNode())])
     template adder(res, k, v) = res[k] = v
     result[0] = getAst(adder(res, n[0][0], n[0][1]))
   of nnkCurly:
     result[2] = n[0]
     if bracketExpr.len == 0:
-      bracketExpr.add(bindSym"initHashSet", newCall(bindSym"typeof",
-          newEmptyNode()))
+      bracketExpr.add(bindSym"initHashSet")
+    if bracketExpr.len == 1:
+      bracketExpr.add(newCall(bindSym"typeof", newEmptyNode()))
     template adder(res, v) = res.incl(v)
     result[0] = getAst(adder(res, n[0]))
   else:
     result[2] = n
     if bracketExpr.len == 0:
-      bracketExpr.add(bindSym"newSeq", newCall(bindSym"typeof", newEmptyNode()))
+      bracketExpr.add(bindSym"newSeq")
+    if bracketExpr.len == 1:
+      bracketExpr.add(newCall(bindSym"typeof", newEmptyNode()))
     template adder(res, v) = res.add(v)
     result[0] = getAst(adder(res, n))
 
-macro collect*(body): untyped =
+macro collect*(body: untyped): untyped =
   ## Comprehension for seqs/sets/tables.
   ##
-  ## The last expression of ``body`` has special syntax that specifies
-  ## the collection's add operation. Use ``{e}`` for set's ``incl``,
-  ## ``{k: v}`` for table's ``[]=`` and ``e`` for seq's ``add``.
+  ## The last expression of `body` has special syntax that specifies
+  ## the collection's add operation. Use `{e}` for set's `incl`,
+  ## `{k: v}` for table's `[]=` and `e` for seq's `add`.
   # analyse the body, find the deepest expression 'it' and replace it via
   # 'result.add it'
   let res = genSym(nskVar, "collectResult")
@@ -57,6 +62,26 @@ macro collect*(body): untyped =
     bracketExpr[1][1] = valueType
   result = newTree(nnkStmtListExpr, newVarStmt(res, newTree(nnkCall,
       bracketExpr)), resBody, res)
+  echo result.treeRepr
+
+macro collect*(init, body: untyped): untyped =
+  # analyse the body, find the deepest expression 'it' and replace it via
+  # 'result.add it'
+  let res = genSym(nskVar, "collectResult")
+  expectKind init, {nnkCall, nnkIdent, nnkSym}
+  let bracketExpr = newTree(nnkBracketExpr,
+    if init.kind == nnkCall: init[0] else: init)
+  let (resBody, keyType, valueType) = trans(body, res, bracketExpr)
+  if bracketExpr.len == 3:
+    bracketExpr[1][1] = keyType
+    bracketExpr[2][1] = valueType
+  else:
+    bracketExpr[1][1] = valueType
+  let call = newTree(nnkCall, bracketExpr)
+  if init.kind == nnkCall:
+    for i in 1 ..< init.len:
+      call.add init[i]
+  result = newTree(nnkStmtListExpr, newVarStmt(res, call), resBody, res)
 
 macro zip*(x: ForLoopStmt): untyped =
   expectKind x, nnkForStmt
@@ -70,14 +95,16 @@ macro zip*(x: ForLoopStmt): untyped =
       for i in 0 .. x[0].len-2:
         iterVars.add x[0][i]
       if zipArgs.len != iterVars.len:
-        error("Not enough values to unpack (expected " & zipArgs.len & " got " & iterVars.len & ")")
+        error("Not enough values to unpack (expected " &
+            $zipArgs.len & " got " & $iterVars.len & ")")
     else:
       iterVars.add x[0] # for x in iter
   else: # for x, y, ... in iter
     for i in 0 .. x.len-3:
       iterVars.add x[i]
     if zipArgs.len != iterVars.len:
-      error("Not enough values to unpack (expected " & zipArgs.len & " got " & iterVars.len & ")")
+      error("Not enough values to unpack (expected " &
+          $zipArgs.len & " got " & $iterVars.len & ")")
   # write: let m = min(len(a), min(len(b), ...))
   let minLen = genSym(nskLet, "m")
   let minArgs = newNimNode(nnkBracket)
@@ -107,112 +134,62 @@ macro zip*(x: ForLoopStmt): untyped =
   newFor.add body
   result.add newFor
 
-when (NimMajor, NimMinor) >= (1, 3):
-  macro enumerate*(x: ForLoopStmt): untyped {.since: (1, 3).} =
-    ## Enumerating iterator for collections.
-    ##
-    ## It yields `(count, value)` tuples (which must be immediately unpacked).
-    ## The default starting count `0` can be manually overridden if needed.
-    runnableExamples:
-      let a = [10, 20, 30]
-      var b: seq[(int, int)]
-      for i, x in enumerate(a):
-        b.add((i, x))
-      assert b == @[(0, 10), (1, 20), (2, 30)]
-
-      let c = "abcd"
-      var d: seq[(int, char)]
-      for i, x in enumerate(97, c):
-        d.add((i, x))
-      assert d == @[(97, 'a'), (98, 'b'), (99, 'c'), (100, 'd')]
-
-    expectKind x, nnkForStmt
-    # check if the starting count is specified:
-    var countStart = if x[^2].len == 2: newLit(0) else: x[^2][1]
-    result = newStmtList()
-    var body = x[^1]
-    if body.kind != nnkStmtList:
-      body = newTree(nnkStmtList, body)
-    var newFor = newTree(nnkForStmt)
-    if x.len == 3: # single iteration variable
-      if x[0].kind == nnkVarTuple: # for (x, y, ...) in iter
-        result.add newVarStmt(x[0][0], infix(countStart, "-", newLit(1)))
-        body.insert(0, newCall(bindSym"inc", x[0][0]))
-        for i in 1 .. x[0].len-2:
-          newFor.add x[0][i]
-      else:
-        error("enumerate iterator doesn't support tuples") # for x in iter
-    else: # for x, y, ... in iter
-      # We strip off the first for loop variable and use it as an integer counter.
-      # We must immediately decrement it by one, because it gets incremented before
-      # the loop body - to be able to use the final expression in other macros.
-      result.add newVarStmt(x[0], infix(countStart, "-", newLit(1)))
-      body.insert(0, newCall(bindSym"inc", x[0]))
-      for i in 1 .. x.len-3:
-        newFor.add x[i]
-    # transform enumerate(X) to 'X'
-    newFor.add x[^2][^1]
-    newFor.add body
-    result.add newFor
-    # now wrap the whole macro in a block to create a new scope
-    result = newBlockStmt(result)
-
 when isMainModule:
-   let
-      a = [1, 3, 5, 7]
-      b = @[0, 2, 4, 6, 8]
-      c = @["one", "two", "three", "four", "five"]
+  import std/enumerate
+  let
+    a = [1, 3, 5, 7]
+    b = @[0, 2, 4, 6, 8]
+    c = @["one", "two", "three", "four", "five"]
+  block:
+    var res: seq[(int, )]
+    for x in zip(a):
+      res.add x
+    assert res == @[(1, ), (3, ), (5, ), (7, )]
+  block:
+    var res: seq[(int, int, int)]
+    for (x, y, z) in zip(a, b, @[-1, -2, -3, -4, -5]):
+      res.add (x, y, z)
+    assert res == @[(1, 0, -1), (3, 2, -2), (5, 4, -3), (7, 6, -4)]
+  block:
+    var res: seq[(int, int)]
+    for x in zip(b, a):
+      res.add x
+    assert res == @[(0, 1), (2, 3), (4, 5), (6, 7)]
+  block:
+    var res: seq[(int, int)]
+    for x, y in zip(a, b):
+      res.add (y, x)
+    assert res == @[(0, 1), (2, 3), (4, 5), (6, 7)]
+  block:
+    var res: seq[(int, int, string)]
+    for (x, y, z) in zip(a, b, c):
+      res.add (x, y, z)
+    assert res == @[(1, 0, "one"), (3, 2, "two"), (5, 4, "three"), (7, 6, "four")]
 
-   block:
-      var res: seq[(int, )]
-      for x in zip(a):
-         res.add x
-      assert res == @[(1, ), (3, ), (5, ), (7, )]
-   block:
-      var res: seq[(int, int, int)]
-      for (x, y, z) in zip(a, b, @[-1, -2, -3, -4, -5]):
-         res.add (x, y, z)
-      assert res == @[(1, 0, -1), (3, 2, -2), (5, 4, -3), (7, 6, -4)]
-   block:
-      var res: seq[(int, int)]
-      for x in zip(b, a):
-         res.add x
-      assert res == @[(0, 1), (2, 3), (4, 5), (6, 7)]
-   block:
-      var res: seq[(int, int)]
-      for x, y in zip(a, b):
-         res.add (y, x)
-      assert res == @[(0, 1), (2, 3), (4, 5), (6, 7)]
-   block:
-      var res: seq[(int, int, string)]
-      for (x, y, z) in zip(a, b, c):
-         res.add (x, y, z)
-      assert res == @[(1, 0, "one"), (3, 2, "two"), (5, 4, "three"), (7, 6, "four")]
-   block:
-      var res: seq[(int, int)]
-      for i, x in enumerate(a):
-         res.add (i, x)
-      assert res == @[(0, 1), (1, 3), (2, 5), (3, 7)]
-   block:
-      var res: seq[(int, int)]
-      for (i, x) in enumerate(a.items):
-         res.add (i, x)
-      assert res == @[(0, 1), (1, 3), (2, 5), (3, 7)]
-
-   var data = @["bird", "word"]
-   assert collect(for (i, d) in enumerate(data.items): (if i mod 2 == 0: d)) == @["bird"]
-   assert collect(for (i, d) in enumerate(data.items): {i: d}) == {1: "word",
-         0: "bird"}.toTable
-   assert collect(for d in data.items: {d}) == data.toHashSet
-   import strutils
-   assert collect(for d in data.items: (try: parseInt(d) except: 0)) == @[0, 0]
-   let x = collect:
+  var data = @["bird", "word"]
+  assert collect(for (i, d) in enumerate(data.items): (if i mod 2 == 0: d)) == @["bird"]
+  assert collect(for (i, d) in enumerate(data.items): {i: d}) == {1: "word",
+      0: "bird"}.toTable
+  assert collect(for d in data.items: {d}) == data.toHashSet
+  import strutils
+  assert collect(for d in data.items: (try: parseInt(d) except: 0)) == @[0, 0]
+  let x = collect:
+    for d in data.items:
+      case d
+      of "bird": "word"
+      else: d
+  assert x == @["word", "word"]
+  assert collect(for (i, d) in enumerate(data.items): (i, d)) == @[(0, "bird"),
+      (1, "word")]
+  assert collect(for (i, d) in enumerate(data.items): {i: d}) == {1: "word",
+      0: "bird"}.toTable
+  block:
+    let x = collect:
       for d in data.items:
-         case d
-         of "bird": "word"
-         else: d
-   assert x == @["word", "word"]
-   assert collect(for (i, d) in enumerate(data.items): (i, d)) == @[(0, "bird"),
-         (1, "word")]
-   assert collect(for (i, d) in enumerate(data.items): {i: d}) == {1: "word",
-         0: "bird"}.toTable
+        when d is int: "word"
+        else: d
+    assert x == @["bird", "word"]
+  assert collect(newSeq, for (i, d) in enumerate(data.items): (i, d)) == @[(0, "bird"),
+      (1, "word")]
+  assert collect(newSeq, for d in data.items: (try: parseInt(d) except: 0)) == @[0, 0]
+  assert collect(initHashSet, for d in data.items: {d}) == data.toHashSet
