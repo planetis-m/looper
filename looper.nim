@@ -21,7 +21,7 @@ proc trans(n, res, bracketExpr: NimNode): (NimNode, NimNode, NimNode) =
     result[1] = n[0][0]
     result[2] = n[0][1]
     if bracketExpr.len == 0:
-      bracketExpr.add(bindSym"initTable")
+      bracketExpr.add(bindSym"initTable") # don't import tables
     if bracketExpr.len == 1:
       bracketExpr.add([newCall(bindSym"typeof",
           newEmptyNode()), newCall(bindSym"typeof", newEmptyNode())])
@@ -44,6 +44,30 @@ proc trans(n, res, bracketExpr: NimNode): (NimNode, NimNode, NimNode) =
     template adder(res, v) = res.add(v)
     result[0] = getAst(adder(res, n))
 
+proc deSym(n: NimNode): NimNode =
+  result = if n.kind == nnkSym: ident(n.strVal) else: n
+
+proc collectImpl(init, body: NimNode): NimNode =
+  let res = genSym(nskVar, "collectResult")
+  var bracketExpr: NimNode
+  if init == nil:
+    bracketExpr = newTree(nnkBracketExpr)
+  else:
+    expectKind init, {nnkCall, nnkIdent, nnkSym}
+    bracketExpr = newTree(nnkBracketExpr,
+      if init.kind == nnkCall: deSym(init[0]) else: deSym(init))
+  let (resBody, keyType, valueType) = trans(body, res, bracketExpr)
+  if bracketExpr.len == 3:
+    bracketExpr[1][1] = keyType
+    bracketExpr[2][1] = valueType
+  else:
+    bracketExpr[1][1] = valueType
+  let call = newTree(nnkCall, bracketExpr)
+  if init != nil and init.kind == nnkCall:
+    for i in 1 ..< init.len:
+      call.add init[i]
+  result = newTree(nnkStmtListExpr, newVarStmt(res, call), resBody, res)
+
 macro collect*(body: untyped): untyped =
   ## Comprehension for seqs/sets/tables.
   ##
@@ -52,36 +76,10 @@ macro collect*(body: untyped): untyped =
   ## `{k: v}` for table's `[]=` and `e` for seq's `add`.
   # analyse the body, find the deepest expression 'it' and replace it via
   # 'result.add it'
-  let res = genSym(nskVar, "collectResult")
-  let bracketExpr = newNimNode(nnkBracketExpr)
-  let (resBody, keyType, valueType) = trans(body, res, bracketExpr)
-  if bracketExpr.len == 3:
-    bracketExpr[1][1] = keyType
-    bracketExpr[2][1] = valueType
-  else:
-    bracketExpr[1][1] = valueType
-  result = newTree(nnkStmtListExpr, newVarStmt(res, newTree(nnkCall,
-      bracketExpr)), resBody, res)
-  echo result.treeRepr
+  result = collectImpl(nil, body)
 
 macro collect*(init, body: untyped): untyped =
-  # analyse the body, find the deepest expression 'it' and replace it via
-  # 'result.add it'
-  let res = genSym(nskVar, "collectResult")
-  expectKind init, {nnkCall, nnkIdent, nnkSym}
-  let bracketExpr = newTree(nnkBracketExpr,
-    if init.kind == nnkCall: init[0] else: init)
-  let (resBody, keyType, valueType) = trans(body, res, bracketExpr)
-  if bracketExpr.len == 3:
-    bracketExpr[1][1] = keyType
-    bracketExpr[2][1] = valueType
-  else:
-    bracketExpr[1][1] = valueType
-  let call = newTree(nnkCall, bracketExpr)
-  if init.kind == nnkCall:
-    for i in 1 ..< init.len:
-      call.add init[i]
-  result = newTree(nnkStmtListExpr, newVarStmt(res, call), resBody, res)
+  result = collectImpl(init, body)
 
 macro zip*(x: ForLoopStmt): untyped =
   expectKind x, nnkForStmt
@@ -135,7 +133,7 @@ macro zip*(x: ForLoopStmt): untyped =
   result.add newFor
 
 when isMainModule:
-  import std/enumerate
+  import std/enumerate, strutils
   let
     a = [1, 3, 5, 7]
     b = @[0, 2, 4, 6, 8]
@@ -168,10 +166,6 @@ when isMainModule:
 
   var data = @["bird", "word"]
   assert collect(for (i, d) in enumerate(data.items): (if i mod 2 == 0: d)) == @["bird"]
-  assert collect(for (i, d) in enumerate(data.items): {i: d}) == {1: "word",
-      0: "bird"}.toTable
-  assert collect(for d in data.items: {d}) == data.toHashSet
-  import strutils
   assert collect(for d in data.items: (try: parseInt(d) except: 0)) == @[0, 0]
   let x = collect:
     for d in data.items:
@@ -181,8 +175,6 @@ when isMainModule:
   assert x == @["word", "word"]
   assert collect(for (i, d) in enumerate(data.items): (i, d)) == @[(0, "bird"),
       (1, "word")]
-  assert collect(for (i, d) in enumerate(data.items): {i: d}) == {1: "word",
-      0: "bird"}.toTable
   block:
     let x = collect:
       for d in data.items:
@@ -192,4 +184,9 @@ when isMainModule:
   assert collect(newSeq, for (i, d) in enumerate(data.items): (i, d)) == @[(0, "bird"),
       (1, "word")]
   assert collect(newSeq, for d in data.items: (try: parseInt(d) except: 0)) == @[0, 0]
+  assert collect(for (i, d) in enumerate(data.items): {i: d}) == {1: "word",
+      0: "bird"}.toTable
+  assert collect(for d in data.items: {d}) == data.toHashSet
+  assert collect(for (i, d) in enumerate(data.items): {i: d}) == {1: "word",
+      0: "bird"}.toTable
   assert collect(initHashSet, for d in data.items: {d}) == data.toHashSet
